@@ -135,9 +135,8 @@ def _read_header(byts: bytes, offset: int = 0) -> Tuple[int, int, int, List[int]
 
 
 def encode_with_cdf(symbols: List[int], cdf: List[int], precision: int = _PRECISION_DEFAULT) -> bytes:
-    """
-    Byte-range encoder.
-    """
+    """Byte-range encoder that matches the accompanying decoder."""
+
     alphabet = len(cdf) - 1
     total = cdf[-1]
     if total <= 0:
@@ -147,67 +146,71 @@ def encode_with_cdf(symbols: List[int], cdf: List[int], precision: int = _PRECIS
     _write_header(out, len(symbols), precision, alphabet, cdf)
 
     low = 0
-    range_ = 0xFFFFFFFF  # full 32-bit range, use Python int for headroom
+    high = 0xFFFFFFFF
 
     for sym in symbols:
         if sym < 0 or sym >= alphabet:
             raise ValueError(f"Symbol {sym} out of range")
-        # compute interval
+
         cum_low = cdf[sym]
         cum_high = cdf[sym + 1]
-        # split range according to totals
-        step = range_ // total
-        new_low = low + step * cum_low
-        new_high = low + step * cum_high - 1
-        low = new_low
-        range_ = new_high - new_low + 1
-        # renormalize
-        while range_ <= (1 << _RENORM_BITS) - 1:
-            # emit top byte of low (big-endian)
-            b = (low >> 24) & 0xFF
-            out.write(bytes((b,)))
-            low = (low << 8) & 0xFFFFFFFFFFFFFFFF  # keep it wide
-            range_ = (range_ << 8) & 0xFFFFFFFFFFFFFFFF
-    # flush remaining bytes (emit 5 bytes of low big-endian to be safe)
-    for shift in (32, 24, 16, 8, 0):
-        out.write(bytes(((low >> shift) & 0xFF,)))
+        freq = cum_high - cum_low
+        if freq <= 0:
+            raise ValueError(f"Non-positive frequency for symbol {sym}")
+
+        range_ = (high - low + 1) // total
+        if range_ == 0:
+            range_ = 1
+
+        new_low = low + range_ * cum_low
+        new_high = low + range_ * cum_high - 1
+        low, high = new_low, new_high
+
+        while (low ^ high) < (1 << 24):
+            out.write(bytes(((low >> 24) & 0xFF,)))
+            low = (low << 8) & 0xFFFFFFFF
+            high = ((high << 8) & 0xFFFFFFFF) | 0xFF
+
+    # Flush 5 bytes of `low` (big-endian) to mirror the previous coder format.
+    for _ in range(5):
+        out.write(bytes(((low >> 24) & 0xFF,)))
+        low = (low << 8) & 0xFFFFFFFF
+
     return out.getvalue()
 
 
 def decode_with_cdf(bytestream: bytes) -> List[int]:
-    """
-    Decode a stream produced by encode_with_cdf.
-    """
+    """Decode a stream produced by :func:`encode_with_cdf`."""
+
     symbols_count, precision, alphabet, cdf, offset = _read_header(bytestream, 0)
     total = cdf[-1]
     if total <= 0:
         raise ValueError("CDF total must be positive")
 
-    # read initial 5 bytes to form code (we wrote 5)
-    if offset + 5 > len(bytestream):
-        raise ValueError("Encoded stream too short")
+    # Prime the decoder with the first 4 bytes (encoder flush guarantees availability)
     code = 0
-    for i in range(5):
-        code = (code << 8) | bytestream[offset + i]
-    offset += 5
+    ptr = offset
+    if ptr + 4 > len(bytestream):
+        raise ValueError("Encoded stream too short")
+    for _ in range(4):
+        code = (code << 8) | (bytestream[ptr] if ptr < len(bytestream) else 0)
+        ptr += 1
 
     low = 0
-    range_ = 0xFFFFFFFF
-    ptr = offset
-    symbols = []
+    high = 0xFFFFFFFF
+    symbols: List[int] = []
 
     for _ in range(symbols_count):
-        step = range_ // total
-        if step == 0:
-            # degenerate; fallback to safe behavior
+        range_ = (high - low + 1) // total
+        if range_ == 0:
+            range_ = 1
+
+        scaled = (code - low) // range_
+        if scaled < 0:
             scaled = 0
-        else:
-            scaled = (code - low) // step
-            if scaled < 0:
-                scaled = 0
-        # find symbol via binary search on cdf
-        # cdf is sorted; use bisect
-        # scaled in [0..total-1], find s so that cdf[s] <= scaled < cdf[s+1]
+        elif scaled >= total:
+            scaled = total - 1
+
         s = bisect.bisect_right(cdf, scaled) - 1
         if s < 0:
             s = 0
@@ -216,21 +219,21 @@ def decode_with_cdf(bytestream: bytes) -> List[int]:
 
         cum_low = cdf[s]
         cum_high = cdf[s + 1]
-        new_low = low + step * cum_low
-        new_high = low + step * cum_high - 1
-        low = new_low
-        range_ = new_high - new_low + 1
+        freq = cum_high - cum_low
+        if freq <= 0:
+            raise ValueError(f"Non-positive frequency for symbol {s}")
 
-        # renormalize: pull bytes while range_ small
-        while range_ <= (1 << _RENORM_BITS) - 1:
-            # shift in next byte
-            if ptr < len(bytestream):
-                next_byte = bytestream[ptr]
-                ptr += 1
-            else:
-                next_byte = 0
-            code = ((code << 8) & 0xFFFFFFFFFFFFFFFF) | next_byte
-            low = (low << 8) & 0xFFFFFFFFFFFFFFFF
-            range_ = (range_ << 8) & 0xFFFFFFFFFFFFFFFF
+        low = low + range_ * cum_low
+        high = low + range_ * freq - 1
+
+        while (low ^ high) < (1 << 24):
+            low = (low << 8) & 0xFFFFFFFF
+            high = ((high << 8) & 0xFFFFFFFF) | 0xFF
+            code = ((code << 8) & 0xFFFFFFFF) | (
+                bytestream[ptr] if ptr < len(bytestream) else 0
+            )
+            ptr += 1
+
         symbols.append(s)
+
     return symbols
