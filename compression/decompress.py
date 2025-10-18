@@ -122,7 +122,24 @@ def main(argv):
         # maybe decompress per-segment payload
         payload = _maybe_decompress_payload(payload, relpath)
         try:
-            arr = _np_load_bytes(payload)
+            # Support custom coder payloads (e.g., .rans) as well as raw .npy/.lzma
+            if relpath.endswith(".rans"):
+                # decode using our range coder and reshape to original segment shape
+                try:
+                    from compression.coder.range_coder import decode_with_cdf
+                except Exception:
+                    raise RuntimeError("rans decoder not available in this installation")
+                symbols = decode_with_cdf(payload)
+                # obtain shape from manifest entry if present
+                shape = seg.get("shape")
+                if shape is None:
+                    # default fallback
+                    shape = (1200, 8, 16)
+                # ensure shape is a tuple
+                shape = tuple(shape)
+                arr = np.array(symbols, dtype=np.int16).reshape(shape)
+            else:
+                arr = _np_load_bytes(payload)
         except Exception as e:
             print(f"Failed to load numpy array for segment {seg_id} from {relpath}: {e}")
             failed.append(seg_id)

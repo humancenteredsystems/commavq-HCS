@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-Stage 0 compressor (streaming, memory-safe, verbose).
-
-Creates a self-describing single archive containing per-segment token files and a manifest.
-This version is responsive: it streams files into the archive, reports progress and heartbeats,
-and supports a --limit for quick smoke tests.
+Stage 1 compressor (adds order-0 rANS coder).
 
 Usage:
   python -m compression.compress --data_files data-0000.tar.gz data-0001.tar.gz \\
-      --output ./compression_challenge_submission.zip --mode pass-through --limit 100 --verbose
+      --output ./compression_challenge_submission.zip --coder rans --limit 100 --verbose
+
+Coder options:
+- pass-through : store .npy payloads (lossless, baseline)
+- lzma         : store lzma-compressed .npy payloads (quick baseline)
+- rans         : encode token stream with order-0 rANS and per-segment CDF (custom coder)
 """
 from pathlib import Path
 import argparse
@@ -24,6 +25,13 @@ from datasets import load_dataset
 
 from compression.io import ArchiveBuilder
 from compression.scan_order import SCAN_ORDER_MANIFEST
+
+# rans coder
+try:
+    from compression.coder.range_coder import build_cdf_from_counts, encode_with_cdf
+except Exception:
+    build_cdf_from_counts = None
+    encode_with_cdf = None
 
 DEFAULT_OUT = "./compression_challenge_submission.zip"
 
@@ -49,19 +57,13 @@ def setup_logging(verbose: bool, logfile: str = None):
     if logfile:
         handlers.append(logging.FileHandler(logfile))
     logging.basicConfig(level=level, format="%(asctime)s %(levelname)s: %(message)s", handlers=handlers)
-    # ensure immediate flush behavior
-    for h in logging.getLogger().handlers:
-        try:
-            h.flush = h.flush
-        except Exception:
-            pass
 
 
 def main(argv):
-    p = argparse.ArgumentParser(description="Stage0 compressor: package token segments into a single archive")
+    p = argparse.ArgumentParser(description="Stage1 compressor: package token segments into an archive with coder support")
     p.add_argument("--data_files", nargs="+", required=True, help="HuggingFace dataset shard tars (data-*.tar.gz)")
     p.add_argument("--output", default=DEFAULT_OUT, help="Output archive path (zip)")
-    p.add_argument("--mode", choices=["pass-through", "lzma"], default="pass-through", help="How to store payloads")
+    p.add_argument("--coder", choices=["pass-through", "lzma", "rans"], default="rans", help="Coder to use")
     p.add_argument("--split_name", default="train", help="Dataset split name")
     p.add_argument("--limit", type=int, default=0, help="If >0, only process the first N segments (for testing)")
     p.add_argument("--progress-interval", type=int, default=100, help="Log heartbeat every N segments")
@@ -78,10 +80,14 @@ def main(argv):
 
     setup_logging(verbose, args.logfile)
     logger = logging.getLogger("compression.compress")
-    logger.info("Starting Stage 0 compressor")
+    logger.info("Starting Stage 1 compressor")
     logger.info(f"Python executable: {sys.executable}")
     logger.info(f"CWD: {Path.cwd()}")
     logger.info(f"Args: {args}")
+
+    if args.coder == "rans" and (build_cdf_from_counts is None or encode_with_cdf is None):
+        logger.error("rans coder not available (compression.coder.range_coder missing).")
+        sys.exit(1)
 
     out_path = Path(args.output).resolve()
     builder = ArchiveBuilder(str(out_path), verbose=verbose)
@@ -90,14 +96,14 @@ def main(argv):
         "version": "0.1.0",
         "git_hash": os.environ.get("GIT_HASH", ""),
         "cli_args": {
-            "mode": args.mode,
+            "mode": args.coder,
             "data_files": args.data_files,
             "split": args.split_name,
         },
         "modules": {
             "transform_chain": [{"name": "identity", "params": {}}],
             "model": {"name": "none"},
-            "coder": {"type": "none"},
+            "coder": {"type": args.coder},
         },
         "dataset": {"segments": []},
     }
@@ -120,7 +126,6 @@ def main(argv):
     limit = min(limit, total_rows)
     logger.info(f"Processing up to {limit} segments (limit={args.limit})")
 
-    streams_meta = []
     start_time = time.time()
     last_heartbeat = start_time
     processed = 0
@@ -130,7 +135,7 @@ def main(argv):
         for i in range(limit):
             try:
                 row = ds[args.split_name][i]
-            except Exception as e:
+            except Exception:
                 logger.exception(f"Failed to read row {i} from dataset")
                 raise
 
@@ -141,23 +146,37 @@ def main(argv):
                 name = row.get("__key__", f"segment-{i:06d}.npy")
             relpath = f"data/{name}"
 
-            tokens = None
             try:
-                tokens = np.array(row["token.npy"])
-            except Exception as e:
+                tokens = np.array(row["token.npy"]).astype(np.int32)
+            except Exception:
                 logger.exception(f"Failed to convert tokens for segment {name} (index {i})")
                 raise
 
-            payload = _np_save_bytes(tokens)
-            if args.mode == "lzma":
+            if args.coder == "pass-through":
+                payload = _np_save_bytes(tokens)
+                # write as-is .npy
+            elif args.coder == "lzma":
+                payload = _np_save_bytes(tokens)
                 import lzma
                 payload = lzma.compress(payload)
                 relpath += ".lzma"
+            elif args.coder == "rans":
+                # flatten tokens to 1D symbols
+                symbols = tokens.ravel().tolist()
+                # compute counts for alphabet 0..1023
+                counts = np.bincount(np.array(symbols, dtype=np.int32), minlength=1024).tolist()
+                cdf = build_cdf_from_counts(counts, precision=16)
+                # encode
+                payload = encode_with_cdf(symbols, cdf, precision=16)
+                # mark file as .rans
+                relpath += ".rans"
+            else:
+                raise RuntimeError("Unknown coder")
 
             # write into the archive (streamed)
             try:
                 builder.add_stream(relpath, payload)
-            except Exception as e:
+            except Exception:
                 logger.exception(f"Failed to write stream {relpath} into archive")
                 raise
 
@@ -176,7 +195,7 @@ def main(argv):
     except KeyboardInterrupt:
         logger.error("Interrupted by user (KeyboardInterrupt). Finalizing partial archive.")
         try:
-            builder.set_manifest(build_manifest(base_manifest, streams_meta))
+            builder.set_manifest(build_manifest(base_manifest, []))
             builder.finalize()
         except Exception:
             logger.exception("Failed to finalize partial archive on interrupt.")
@@ -191,7 +210,7 @@ def main(argv):
 
     # finalize manifest and archive
     try:
-        manifest = build_manifest(base_manifest, streams_meta)
+        manifest = build_manifest(base_manifest, [])
         manifest["scan_order"] = SCAN_ORDER_MANIFEST
         builder.set_manifest(manifest)
         logger.info("Writing manifest and finalizing archive...")
