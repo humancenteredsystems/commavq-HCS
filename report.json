@@ -1,0 +1,14 @@
+{
+  "archive": "compression_challenge_submission.zip",
+  "archive_bytes": 1153549,
+  "segments_count": 5,
+  "tokens_total": 768000,
+  "compression_rate": 0.8322143229286315,
+  "bits_per_token": 12.016135416666666,
+  "verification": {
+    "missing_files": [],
+    "no_ground_truth": [],
+    "mismatches": [],
+    "compared": 5
+  }
+}

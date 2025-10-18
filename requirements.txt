@@ -1,3 +1,5 @@
 tqdm
 datasets==4.0.0
-torch==2.2.2
+torch>=2.6.0,<3.0.0
+numpy
+typing-extensions
